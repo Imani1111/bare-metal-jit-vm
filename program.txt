@@ -1,0 +1,5 @@
+#This is my custom language!
+MOV V0, 10
+MOV V1, 32
+ADD V0, V1
+RETURN V0
