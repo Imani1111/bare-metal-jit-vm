@@ -28,6 +28,7 @@
 #define OP_LOAD       0x17
 #define OP_STORE      0x18
 #define OP_LET        0x19
+#define OP_CALL       0x1A
 
 #define V0 0
 #define V1 1
@@ -130,6 +131,14 @@ uint8_t parse_operand(char* operand, SymbolTable_t* s_table)
     }
     return get_or_create_variable(s_table, operand);
 }
+
+int parse_function(const char* function_name)
+{
+    if (strcmp(function_name, "puts") == 0) return 0;
+    fprintf(stderr, "Error: Unknown function '%s'\n", function_name);
+    exit(1);
+}
+
 char string_pool[4096];
 uint32_t string_pool_offset = 0;
 int main(int argc, char** argv)
@@ -333,6 +342,10 @@ int main(int argc, char** argv)
             uint8_t ptr = parse_operand(arg1, &s_table);
             uint8_t val = parse_operand(arg2, &s_table);
             compiled_instruction = OP_STORE | ((ptr & 0xFF) << 8) | ((val & 0xFFFF) << 16);
+        }
+        else if (strcmp(op, "CALL") == 0 || strcmp(op, "call") == 0){
+            int dest = parse_function(arg1);
+            compiled_instruction = OP_CALL | ((dest & 0xFF) << 8);
         }
         else if (strcmp(op, "RETURN") == 0 || strcmp(op, "return") == 0){
             int dest = parse_register(arg1);

@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <sys/mman.h>
@@ -63,6 +65,7 @@
 #define OP_LOAD       0x17
 #define OP_STORE      0x18
 #define OP_LET        0x19
+#define OP_CALL       0x1A
 // virtual registers
 #define V0  0 
 #define V1  1
@@ -79,6 +82,8 @@
 #define PAGE_SIZE 4096
 #define REMOVE_BIT7 0b01111111 // Binary representation of 0x7F
 #define BIT7_CHECKER 0b10000000 // Binary representation of 0x80
+                                
+#define MAX_EXTERNAL_ENTRIES 64
 
 typedef enum {
     REG_RAX = 0, REG_RCX = 1, REG_RDX = 2, REG_RBX = 3,
@@ -103,8 +108,26 @@ typedef struct {
     uint8_t instruction_size;
 }ForwardJumpPatch_t;
 
+typedef struct {
+    char function_name[64];
+    void* function_address;
+}GOT_Entry_t;
+
+typedef struct {
+    GOT_Entry_t function_entries[MAX_EXTERNAL_ENTRIES];
+    size_t entry_count;
+}GlobalOffsetTable_t;
+
+typedef struct {
+    char name[64];
+    uint8_t* got_entry_pointer;
+}ProcedureLinkageTable_t;
+
 ForwardJumpPatch_t patch_list[MAX_PATCH_ADDRESSES];
 size_t patch_count = 0;
+
+GlobalOffsetTable_t global_offset_table;
+ProcedureLinkageTable_t procedure_linkage_table[MAX_EXTERNAL_ENTRIES];
 
 static inline void emit_u8(uint8_t** buffer, uint8_t byte)
 {
@@ -337,6 +360,30 @@ static inline void emit_x86_cmp_r64_r64_or_r64_imm(uint8_t** code_pointer, uint8
         emit_u32(code_pointer, immediate);
     }
 }
+
+static inline void emit_x86_call(uint8_t** code_pointer, uint8_t arg_register, void* plt_stub_address, X86Reg scratch_reg)
+{
+    // 1. Load the argument from VM register [rbx + arg_register * 8] into RDI (1st argument in System V ABI)
+    emit_u8(code_pointer, REX_W); 
+    emit_u8(code_pointer, MOV_VAL_FROM_RM_TO_REG); 
+    emit_dynamic_modrm(code_pointer, MEM_MOD_8BYTE_DISP, scratch_reg, REG_RBX);
+    emit_u8(code_pointer, arg_register * 8);
+
+    // Move scratch_reg (e.g., RAX) into RDI
+    emit_u8(code_pointer, REX_W); 
+    emit_u8(code_pointer, MOV_VAL_FROM_REG_TO_RM); 
+    emit_dynamic_modrm(code_pointer, MOD_REG_TO_REG, scratch_reg, REG_RDI);
+
+    // 2. Load the absolute address of the PLT stub into RAX
+    emit_u8(code_pointer, REX_W); 
+    emit_u8(code_pointer, MOV_64BIT_CONSTANT_FROM_RM_TO_REG);
+    emit_u64(code_pointer, (uint64_t)plt_stub_address);
+
+    // 3. Call the PLT stub using 'call rax' (Opcodes: FF D0)
+    emit_u8(code_pointer, 0xFF);
+    emit_u8(code_pointer, 0xD0);
+}
+
 // ret [rbx + offset] places the value of [rbx + offset] in rax and hands over execution
 static inline void emit_x86_mov_vreg_to_rax(uint8_t** code_pointer, uint8_t destination_register)
 { 
@@ -375,6 +422,57 @@ static inline void print_instruction_disassembly(const uint32_t* instruction_map
         ptr++;
     }
     printf("\n");
+}
+
+void initialize_got()
+{
+    global_offset_table.entry_count = 0;
+    // 1. --> puts()
+    strcpy(global_offset_table.function_entries[global_offset_table.entry_count].function_name, "puts");
+    global_offset_table.function_entries[global_offset_table.entry_count].function_address = dlsym(RTLD_DEFAULT, "puts");
+    global_offset_table.entry_count++;
+    // 2. --> printf()
+    strcpy(global_offset_table.function_entries[global_offset_table.entry_count].function_name, "printf");
+    global_offset_table.function_entries[global_offset_table.entry_count].function_address = dlsym(RTLD_DEFAULT, "printf");
+    global_offset_table.entry_count++;
+}
+
+int get_got_index(const char* name)
+{
+    for (int i = 0; i < global_offset_table.entry_count; i++){
+        if (strcmp(global_offset_table.function_entries[i].function_name, name) == 0){
+            return i;
+        }
+    }
+    void* resolved = dlsym(RTLD_DEFAULT, name);
+    if (resolved){
+        int index = global_offset_table.entry_count++;
+        strcpy(global_offset_table.function_entries[index].function_name, name);
+        global_offset_table.function_entries[index].function_address = resolved;
+        return index;
+    }
+    return -1;
+}
+
+void init_plt_from_got(ProcedureLinkageTable_t* plt)
+{
+    for (size_t i = 0; i < global_offset_table.entry_count; i++){
+        uint8_t* plt_stub = mmap(NULL , 16, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        uint8_t* plt_pointer = plt_stub;
+ 
+        emit_u8(&plt_pointer,  REX_W); emit_u8(&plt_pointer, MOV_64BIT_CONSTANT_FROM_RM_TO_REG);
+
+        strncpy(plt[i].name, global_offset_table.function_entries[i].function_name, sizeof(plt[i].name) - 1);
+
+        uint64_t function_address = (uint64_t)global_offset_table.function_entries[i].function_address;   
+        emit_u64(&plt_pointer, function_address);
+        
+        uint8_t jmp = 0xFF;
+        uint8_t rax = 0xE0;
+        emit_u8(&plt_pointer, jmp);
+        emit_u8(&plt_pointer, rax);
+        plt[i].got_entry_pointer = plt_stub;
+    }
 }
 
 static inline uint8_t* jit_create(size_t required_size)
@@ -499,6 +597,48 @@ void run_jit_compiler(uint32_t* code_to_be_executed, size_t instruction_count, V
                             emit_x86_mov_imm(&code_pointer, destination_register, string_address);
                             break;
                          }
+            case OP_CALL: {
+                              int function_index = destination_register; 
+                              void* target_plt_stub = procedure_linkage_table[function_index].got_entry_pointer;
+                              // 2. Implicitly load v0 -> RDI
+                             emit_u8(&code_pointer, REX_W); 
+                             emit_u8(&code_pointer, MOV_VAL_FROM_RM_TO_REG); 
+                             emit_dynamic_modrm(&code_pointer, MEM_MOD_8BYTE_DISP, REG_RAX, REG_RBX);
+                             emit_u8(&code_pointer, V0 * 8); // Offset for v0
+
+                             emit_u8(&code_pointer, REX_W); 
+                             emit_u8(&code_pointer, MOV_VAL_FROM_REG_TO_RM); 
+                             emit_dynamic_modrm(&code_pointer, MOD_REG_TO_REG, REG_RAX, REG_RDI);
+
+                             // 3. Implicitly load v1 -> RSI
+                             emit_u8(&code_pointer, REX_W); 
+                             emit_u8(&code_pointer, MOV_VAL_FROM_RM_TO_REG); 
+                             emit_dynamic_modrm(&code_pointer, MEM_MOD_8BYTE_DISP, REG_RAX, REG_RBX);
+                             emit_u8(&code_pointer, V1 * 8); // Offset for v1
+
+                             emit_u8(&code_pointer, REX_W); 
+                             emit_u8(&code_pointer, MOV_VAL_FROM_REG_TO_RM); 
+                             emit_dynamic_modrm(&code_pointer, MOD_REG_TO_REG, REG_RAX, REG_RSI);
+
+                             // 4. Implicitly load v2 -> RDX
+                             emit_u8(&code_pointer, REX_W); 
+                             emit_u8(&code_pointer, MOV_VAL_FROM_RM_TO_REG); 
+                             emit_dynamic_modrm(&code_pointer, MEM_MOD_8BYTE_DISP, REG_RAX, REG_RBX);
+                             emit_u8(&code_pointer, V2 * 8); // Offset for v2
+
+                             emit_u8(&code_pointer, REX_W); 
+                             emit_u8(&code_pointer, MOV_VAL_FROM_REG_TO_RM); 
+                             emit_dynamic_modrm(&code_pointer, MOD_REG_TO_REG, REG_RAX, REG_RDX);
+
+                             // 5. Load the PLT stub address into RAX and perform the call
+                             emit_u8(&code_pointer, REX_W); 
+                             emit_u8(&code_pointer, MOV_64BIT_CONSTANT_FROM_RM_TO_REG);
+                             emit_u64(&code_pointer, (uint64_t)target_plt_stub);
+
+                             emit_u8(&code_pointer, 0xFF);
+                             emit_u8(&code_pointer, 0xD0); // call rax
+                             break;
+                          }
             case OP_RETURN: {
                                 emit_x86_mov_vreg_to_rax(&code_pointer, destination_register);
                                 emit_u8(&code_pointer, POP_RBX); // pop rbx
@@ -602,6 +742,9 @@ int main(int argc, char** argv)
         fprintf(stderr, "Usage: %s <program.cvm>\n", argv[0]);
         return 1;
     }
+
+    initialize_got();
+    init_plt_from_got(procedure_linkage_table);
 
     VMState_t* vm = calloc(1, sizeof(VMState_t)); 
     load_and_run_file(argv[1], vm);
