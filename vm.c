@@ -16,14 +16,15 @@
 
 #define MOV_VAL_FROM_RM_TO_REG 0x8B  // mov dest, src
 #define MOV_VAL_FROM_REG_TO_RM 0x89
+#define MOV_ZERO_EXTEND 0xB6
 #define MOV_CONSTANT_DIRECTLY_TO_MEM_ADDR 0xC7
+#define MOV_64BIT_CONSTANT_FROM_RM_TO_REG 0xB8
 #define ADD_REG_TO_RM 0x01
 #define SUB_REG_FROM_RM 0x29
 #define XOR_REG_TO_REG 0x31
 #define UNCONDITIONAL_JMP 0xE9
-#define CONDITIONAL_JNE_BYTE1 0x0F
+#define PREFIX_FOR_EXTENDED_OPCODES 0x0F
 #define CONDITIONAL_JNE_BYTE2 0x85
-#define CONDITIONAL_JE_BYTE1 0x0F
 #define CONDITIONAL_JE_BYTE2 0x84
 #define CMP_REG_TO_REG 0x3B
 #define CMP_REG_TO_IMM 0x81
@@ -61,6 +62,7 @@
 #define OP_INDEX_PTRQ 0x16
 #define OP_LOAD       0x17
 #define OP_STORE      0x18
+#define OP_LET        0x19
 // virtual registers
 #define V0  0 
 #define V1  1
@@ -86,8 +88,14 @@ typedef enum {
 } X86Reg;
 
 typedef struct {
-    uint64_t registers[3];
+    uint64_t registers[32];
 }VMState_t;
+
+typedef struct {
+    uint8_t magic_signature[4];
+    uint64_t instruction_count;
+    uint8_t* string_pool_base;
+}VMBinaryHeader_t;
 
 typedef struct {
     uint8_t* address_storing_my_placeholder_instr;
@@ -146,17 +154,24 @@ static inline void emit_i32(uint8_t** buffer, int32_t value)
    emit_i8(buffer, (value >> 16) & 0xFF);
    emit_i8(buffer, (value >> 24) & 0xFF);
 }
-// mov [rdi + offset], imm
-static inline void emit_x86_mov_imm(uint8_t** buffer, uint8_t destination_register, uint16_t immediate)
+
+static inline void emit_u64(uint8_t** code_pointer, uint64_t immediate)
+{
+    emit_u32(code_pointer, (uint32_t)(immediate & 0xFFFFFFFF));
+    emit_u32(code_pointer, (uint32_t)(immediate >> 32));
+}
+// mov [rbx + offset], imm
+static inline void emit_x86_mov_imm(uint8_t** buffer, uint8_t destination_register, uint64_t immediate)
 {
     uint8_t cleaned_dest = destination_register & REMOVE_BIT7;
     emit_u8(buffer, REX_W);
-    emit_u8(buffer, MOV_CONSTANT_DIRECTLY_TO_MEM_ADDR);
+    emit_u8(buffer, MOV_64BIT_CONSTANT_FROM_RM_TO_REG);
+    emit_u64(buffer, immediate);
+    emit_u8(buffer, REX_W); emit_u8(buffer, MOV_VAL_FROM_REG_TO_RM);
     emit_dynamic_modrm(buffer, MEM_MOD_8BYTE_DISP, 0, REG_RBX); 
     emit_u8(buffer, cleaned_dest * 8);
-    emit_u32(buffer, immediate);
 }
-// mov [rdi + offset], [rdi + offset]
+// mov [rbx + offset], [rbx + offset]
 static inline void emit_x86_mov_r64_r64(uint8_t** code_pointer, uint8_t destination_register, uint8_t source_register, 
                                         X86Reg scratch_register)
 {   // 
@@ -194,8 +209,8 @@ static inline void emit_x86_xor(uint8_t** buffer, uint8_t destination_register, 
     emit_u8(buffer, REX_W); emit_u8(buffer, XOR_REG_TO_REG); emit_dynamic_modrm(buffer, MEM_MOD_8BYTE_DISP, scratch_reg, REG_RBX);
     emit_u8(buffer, destination_register * 8);
 }
-// mov rax, [rdi + offset](base memory address of the array) then mov rcx, [rdi + offset](this is the index number)
-// then lea rax, [rax + rcx*scale] then mov [rdi + offset], rax 
+// mov rax, [rbx + offset](base memory address of the array) then mov rcx, [rbx + offset](this is the index number)
+// then lea rax, [rax + rcx*scale] then mov [rbx + offset], rax 
 static inline void emit_x86_array_indexing(uint8_t** code_pointer, X86Reg x86_base_register, X86Reg x86_index_register, 
                                            uint8_t v_base_reg, uint8_t v_index_reg, uint8_t scale)
 {
@@ -206,9 +221,12 @@ static inline void emit_x86_array_indexing(uint8_t** code_pointer, X86Reg x86_ba
                                                                                 MEM_MOD_8BYTE_DISP, REG_RCX, REG_RBX);
     emit_u8(code_pointer, v_index_reg * 8);
     X86Reg trigger_sib_byte = REG_RSP; // Because REG_RSP is 4 or 0b100 which tells the modrm byte to look for the sib byte
-    emit_u8(code_pointer, REX_W); emit_u8(code_pointer, LOAD_EFFECTIVE_ADDR); emit_dynamic_modrm(code_pointer, 
-                                                                                MOD_NO_DISPLACEMENT, REG_RAX, trigger_sib_byte);
+    emit_u8(code_pointer, REX_W); emit_u8(code_pointer, LOAD_EFFECTIVE_ADDR);
+    // only use MEM_MOD_8BYTE_DISP (0x01) when passing REG_RAX as base memory address otherwise use MOD_NO_DISPLACEMENT (0x00)
+    // and remember that when you use 0x00 the cpu truncates rax and rcx to eax and ecx so this means it uses 32-bit addressing math
+    emit_dynamic_modrm(code_pointer, MEM_MOD_8BYTE_DISP, REG_RAX, trigger_sib_byte);
     emit_dynamic_sib_byte(code_pointer, x86_index_register, x86_base_register, scale);
+    emit_i8(code_pointer, 0x00); // 0x01 requires a displacement byte to be added so im hardcoding 0x00 for lea rax, [rax, rcx*scale] + 0
     emit_u8(code_pointer, REX_W); emit_u8(code_pointer, MOV_VAL_FROM_REG_TO_RM); emit_dynamic_modrm(code_pointer, MEM_MOD_8BYTE_DISP,
                                                                                  REG_RAX, REG_RBX);
     emit_u8(code_pointer, v_base_reg * 8);
@@ -221,7 +239,7 @@ static inline void emit_x86_load_mem_r64(uint8_t** code_pointer, uint8_t destina
                                                                                 MEM_MOD_8BYTE_DISP, scratch_reg, REG_RBX);
     emit_u8(code_pointer, mem_address * 8);
     uint8_t dereference_rax_into_rax = 0x00;
-    emit_u8(code_pointer, REX_W); emit_u8(code_pointer, MOV_VAL_FROM_RM_TO_REG);
+    emit_u8(code_pointer, REX_W); emit_u8(code_pointer, PREFIX_FOR_EXTENDED_OPCODES); emit_u8(code_pointer, MOV_ZERO_EXTEND);
     emit_u8(code_pointer, dereference_rax_into_rax);
     emit_u8(code_pointer, REX_W); emit_u8(code_pointer, MOV_VAL_FROM_REG_TO_RM); emit_dynamic_modrm(code_pointer, 
                                                                                 MEM_MOD_8BYTE_DISP, scratch_reg, REG_RBX);
@@ -266,11 +284,11 @@ static inline void emit_x86_jne(uint8_t** code_pointer, uint32_t target_instruct
         uint32_t target_x86_offset = jit_label_map[target_instruction];
         uint32_t current_x86_offset = (uint32_t)(*code_pointer - buffer_base);
         int32_t relative_offset = (int32_t)target_x86_offset - (int32_t)(current_x86_offset + 6);
-        emit_u8(code_pointer, CONDITIONAL_JNE_BYTE1);
+        emit_u8(code_pointer, PREFIX_FOR_EXTENDED_OPCODES);
         emit_u8(code_pointer, CONDITIONAL_JNE_BYTE2);
         emit_i32(code_pointer, relative_offset);
     }else{
-        emit_u8(code_pointer, CONDITIONAL_JNE_BYTE1);
+        emit_u8(code_pointer, PREFIX_FOR_EXTENDED_OPCODES);
         emit_u8(code_pointer, CONDITIONAL_JNE_BYTE2);
         patch_list[patch_count].address_storing_my_placeholder_instr = *code_pointer;
         patch_list[patch_count].target_instruction = target_instruction;
@@ -287,11 +305,11 @@ static inline void emit_x86_je_or_jz(uint8_t** code_pointer, uint32_t target_ins
         uint32_t target_x86_offset = jit_label_map[target_instruction];
         uint32_t current_x86_offset = (uint32_t)(*code_pointer - buffer_base);
         int32_t relative_offset = (int32_t)target_x86_offset - (int32_t)current_x86_offset;
-        emit_u8(code_pointer, CONDITIONAL_JE_BYTE1);
+        emit_u8(code_pointer, PREFIX_FOR_EXTENDED_OPCODES);
         emit_u8(code_pointer, CONDITIONAL_JE_BYTE2);
         emit_i32(code_pointer, relative_offset);
     }else{
-        emit_u8(code_pointer, CONDITIONAL_JE_BYTE1);
+        emit_u8(code_pointer, PREFIX_FOR_EXTENDED_OPCODES);
         emit_u8(code_pointer, CONDITIONAL_JE_BYTE2);
         patch_list[patch_count].address_storing_my_placeholder_instr = *code_pointer;
         patch_list[patch_count].target_instruction = target_instruction;
@@ -319,7 +337,7 @@ static inline void emit_x86_cmp_r64_r64_or_r64_imm(uint8_t** code_pointer, uint8
         emit_u32(code_pointer, immediate);
     }
 }
-// ret [rdi + offset] places the value of [rdi + offset] in rax and hands over execution
+// ret [rbx + offset] places the value of [rbx + offset] in rax and hands over execution
 static inline void emit_x86_mov_vreg_to_rax(uint8_t** code_pointer, uint8_t destination_register)
 { 
     emit_u8(code_pointer, REX_W); emit_u8(code_pointer, MOV_VAL_FROM_RM_TO_REG); emit_dynamic_modrm(code_pointer, MEM_MOD_8BYTE_DISP, 
@@ -359,17 +377,25 @@ static inline void print_instruction_disassembly(const uint32_t* instruction_map
     printf("\n");
 }
 
-static inline uint8_t* jit_create(size_t page_size)
+static inline uint8_t* jit_create(size_t required_size)
 {
-    uint8_t* executable_code_buffer = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | 
+    size_t alloc_size = ((required_size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    uint8_t* executable_code_buffer = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | 
                                            MAP_PRIVATE, -1, 0);
+    if (executable_code_buffer == MAP_FAILED){
+        perror("mmap failed");
+        exit(1);
+    }
     return executable_code_buffer;
 }
 
-void run_jit_compiler(uint32_t* code_to_be_executed, size_t instruction_count, VMState_t* vm_state)
+void run_jit_compiler(uint32_t* code_to_be_executed, size_t instruction_count, VMState_t* vm_state, uint8_t* string_pool_base)
 {
     uint32_t* jit_custom_label_tracker = malloc(instruction_count * sizeof(uint32_t));
-    uint8_t* executable_code_buffer = jit_create(PAGE_SIZE);
+
+    size_t estimated_size = instruction_count * 64;
+    if (estimated_size < PAGE_SIZE) estimated_size = PAGE_SIZE;
+    uint8_t* executable_code_buffer = jit_create(estimated_size);
     uint8_t* code_pointer = executable_code_buffer;
     // [PROLOGUE] Save C's RBX, then copy vm_state (RDI) into RBX 
     emit_u8(&code_pointer, PUSH_RBX);
@@ -467,6 +493,12 @@ void run_jit_compiler(uint32_t* code_to_be_executed, size_t instruction_count, V
                                emit_x86_store(&code_pointer, destination_register, source_register, REG_RAX);
                                break;
                            }
+            case OP_LET: {
+                             uint16_t string_index = immediate;
+                            uint64_t string_address = (uint64_t)(uintptr_t)string_pool_base + string_index;
+                            emit_x86_mov_imm(&code_pointer, destination_register, string_address);
+                            break;
+                         }
             case OP_RETURN: {
                                 emit_x86_mov_vreg_to_rax(&code_pointer, destination_register);
                                 emit_u8(&code_pointer, POP_RBX); // pop rbx
@@ -475,12 +507,14 @@ void run_jit_compiler(uint32_t* code_to_be_executed, size_t instruction_count, V
                             }
         }
     }
+    size_t alloc_size = estimated_size;
+
     resolve_patch_addresses(jit_custom_label_tracker, executable_code_buffer);
     uint32_t total_bytes = (uint32_t)(code_pointer - executable_code_buffer);
     for (size_t i = 0; i < instruction_count; i++){
         print_instruction_disassembly(jit_custom_label_tracker, executable_code_buffer, i, total_bytes, instruction_count);
     }
-    mprotect(executable_code_buffer, PAGE_SIZE, PROT_READ | PROT_EXEC);
+    mprotect(executable_code_buffer, alloc_size, PROT_READ | PROT_EXEC);
 
     typedef uint64_t(*JITFunc)(VMState_t*);
     JITFunc compiled_code = (JITFunc)executable_code_buffer;
@@ -491,7 +525,7 @@ void run_jit_compiler(uint32_t* code_to_be_executed, size_t instruction_count, V
     printf("VM Register State: V0=%llu, V1=%llu, V2=%llu\n",
                 vm_state->registers[V0], vm_state->registers[V1], vm_state->registers[V2]);
 
-    munmap(executable_code_buffer, PAGE_SIZE);
+    munmap(executable_code_buffer, alloc_size);
 }
 
 void load_and_run_file(const char* cvm_file, VMState_t* vm_state)
@@ -501,32 +535,54 @@ void load_and_run_file(const char* cvm_file, VMState_t* vm_state)
         perror("Error: Failed to open .cvm file\n");
         return;
     }
-    char magic[4];
-    if (fread(magic, 1, 4, infile) != 4 || magic[0] != 'C' || 
-            magic[1] != 'V' || magic[2] != 'M' || magic[3] != '0'){
+    VMBinaryHeader_t binary_header;
+    if (fread(binary_header.magic_signature, 1, 4, infile) != 4 || binary_header.magic_signature[0] != 'C' || 
+            binary_header.magic_signature[1] != 'V' || binary_header.magic_signature[2] != 'M' || binary_header.magic_signature[3] != '0'){
         fprintf(stderr, "Invalid File binary format (Magic Number Mismatch)\n");
         printf("HINT: Try assembling txt file with my assembler\n");
         fclose(infile);
         return;
     }
 
-    uint64_t instruction_count = 0;
-    if (fread(&instruction_count, sizeof(uint64_t), 1, infile) != 1){
+    if (fread(&binary_header.instruction_count, sizeof(uint64_t), 1, infile) != 1){
         fprintf(stderr, "Error: Failed to read instruction count from header.\n");
         fclose(infile);
         return;
     }
+    
+    uint32_t pool_size = 0;
+    if (fread(&pool_size, sizeof(uint32_t), 1, infile) != 1){
+        fprintf(stderr, "Error: Failed to read string pool size.\n");
+        fclose(infile);
+        return;
+    }
 
-    uint32_t* dynamic_program = malloc(instruction_count * sizeof(uint32_t));
+    uint8_t* string_pool_base = NULL;
+    if (pool_size > 0){
+        string_pool_base = malloc(pool_size);
+        if (!string_pool_base){
+            fprintf(stderr, "Error: Out of memory allocating string pool\n");
+            fclose(infile);
+            return;
+        }
+        if (fread(string_pool_base, 1, pool_size, infile) != pool_size){
+            fprintf(stderr, "Failed to read string pool data\n");
+            free(string_pool_base);
+            fclose(infile);
+            return;
+        }
+    }
+
+    uint32_t* dynamic_program = malloc(binary_header.instruction_count * sizeof(uint32_t));
     if (!dynamic_program){
         fprintf(stderr, "Out of memory allocating instruction buffer\n");
         fclose(infile);
         return;
     }
 
-    size_t read_count = fread(dynamic_program, sizeof(uint32_t), instruction_count, infile);
-    if (read_count != instruction_count){
-        fprintf(stderr, "Error: File ended early, expected %llu instructions, got %zu.\n", instruction_count,
+    size_t read_count = fread(dynamic_program, sizeof(uint32_t), binary_header.instruction_count, infile);
+    if (read_count != binary_header.instruction_count){
+        fprintf(stderr, "Error: File ended early, expected %llu instructions, got %zu.\n", binary_header.instruction_count,
                     read_count);
         free(dynamic_program);
         fclose(infile);
@@ -535,8 +591,9 @@ void load_and_run_file(const char* cvm_file, VMState_t* vm_state)
 
     fclose(infile);
     
-    run_jit_compiler(dynamic_program, instruction_count, vm_state);
+    run_jit_compiler(dynamic_program, binary_header.instruction_count, vm_state, string_pool_base);
     free(dynamic_program);
+    free(string_pool_base);
 }
 
 int main(int argc, char** argv)
@@ -546,8 +603,9 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    VMState_t vm = {.registers = {0, 0, 0}};
-    load_and_run_file(argv[1], &vm);
-
+    VMState_t* vm = calloc(1, sizeof(VMState_t)); 
+    load_and_run_file(argv[1], vm);
+    
+    free(vm);
     return 0;
 }

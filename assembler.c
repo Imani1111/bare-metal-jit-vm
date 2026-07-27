@@ -27,6 +27,7 @@
 #define OP_INDEX_PTRQ 0x16
 #define OP_LOAD       0x17
 #define OP_STORE      0x18
+#define OP_LET        0x19
 
 #define V0 0
 #define V1 1
@@ -127,7 +128,6 @@ uint8_t parse_operand(char* operand, SymbolTable_t* s_table)
     }
     return get_or_create_variable(s_table, operand);
 }
-
 char string_pool[4096];
 uint32_t string_pool_offset = 0;
 int main(int argc, char** argv)
@@ -191,19 +191,31 @@ int main(int argc, char** argv)
         if (len2 > 0 && arg2[len2 - 1] == ',') arg2[len2 - 1] = '\0';
 
         uint32_t compiled_instruction = 0;
-        if (strcmp(op, "MOV") == 0 || strcmp(op, "LET") == 0 || strcmp(op, "mov") == 0 || strcmp(op, "let") == 0){
+        if (strcmp(op, "MOV") == 0 || strcmp(op, "mov") == 0){
             uint8_t dest = parse_operand(arg1, &s_table);
+            int src = parse_register(arg2);
+                if (src != -1){
+                    uint8_t reg_mode_dest = (dest & SET_BIT7_TO_ZERO);
+                    compiled_instruction = OP_MOV | ((reg_mode_dest & 0xFF) << 8) | ((src & 0xFFFF) << 16);
+                }else{
+                    uint8_t imm_mode_dest = (dest | SET_BIT7_TO_ONE);
+                    int imm = atoi(arg2);
+                    compiled_instruction = OP_MOV | (imm_mode_dest << 8) | ((imm & 0xFFFF) << 16);
+                }
+        }
+        else if (strcmp(op, "LET") == 0 || strcmp(op, "let") == 0){
+            uint8_t dest = parse_operand(arg1, &s_table);
+            int src = parse_register(arg2);
             if (arg2[0] == '"'){
                 uint8_t imm_mode_dest = dest | SET_BIT7_TO_ONE;
                 char clean_str[128];
                 sscanf(arg2, "\"%[^\"]\"", clean_str); // Extracts text inside the quotes
-                uint32_t current_str_address = (uint32_t)(uintptr_t)&string_pool[string_pool_offset];
+                uint64_t current_str_address = (uint64_t)(uintptr_t)&string_pool[string_pool_offset];
+                compiled_instruction = OP_LET | (imm_mode_dest << 8) | (string_pool_offset << 16);
                 strcpy(&string_pool[string_pool_offset], clean_str);
                 string_pool_offset += strlen(clean_str) + 1;
-                compiled_instruction = OP_MOV | (imm_mode_dest << 8) | (current_str_address << 16);
             }
             else{
-                int src = parse_register(arg2);
                 if (src != -1){
                     uint8_t reg_mode_dest = (dest & SET_BIT7_TO_ZERO);
                     compiled_instruction = OP_MOV | ((reg_mode_dest & 0xFF) << 8) | ((src & 0xFFFF) << 16);
@@ -274,12 +286,12 @@ int main(int argc, char** argv)
             }
         }
         // IM TIREED IMPLEMENTING VARIABLE'S MEMORY ALLOCATION AND RETRIEVAL IS NOT A JOKE!
-        else if (strcmp(op, "INDEX_PTRB") == 0 || strcmp(op, "indexptr_b") == 0){
+        else if (strcmp(op, "INDEXPTR_B") == 0 || strcmp(op, "indexptr_b") == 0){
             uint8_t base = parse_operand(arg1, &s_table);
             uint8_t index = parse_operand(arg2, &s_table);
             compiled_instruction = OP_INDEX_PTRB | ((base & 0xFF) << 8) | ((index & 0xFFFF) << 16);
         }
-        else if (strcmp(op, "INDEX_PTRQ") == 0 || strcmp(op, "index_ptrq") == 0) { // 8 bytes
+        else if (strcmp(op, "INDEX_PTR_Q") == 0 || strcmp(op, "indexptr_q") == 0) { // 8 bytes
             uint8_t base = parse_operand(arg1, &s_table);
             uint8_t index  = parse_operand(arg2, &s_table);
             compiled_instruction = OP_INDEX_PTRQ | ((base & 0xFF) << 8) | ((index & 0xFFFF) << 16);
@@ -318,8 +330,16 @@ int main(int argc, char** argv)
     }
 
     fwrite(MAGIC_NUMBER, 1, 4, outfile);
+
     uint64_t count_64 = instruction_count;
     fwrite(&count_64, sizeof(uint64_t), 1, outfile);
+
+    uint32_t pool_size = string_pool_offset;
+    fwrite(&pool_size, sizeof(uint32_t), 1, outfile);
+    if (pool_size > 0) {
+        fwrite(string_pool, 1, pool_size, outfile);
+    }
+
     fwrite(instruction_buffer, sizeof(uint32_t), instruction_count, outfile);
 
     fclose(outfile);
