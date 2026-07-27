@@ -62,6 +62,8 @@ typedef struct{
     uint8_t count;
 }SymbolTable_t;
 
+SymbolTable_t s_table = { .count = 0};
+
 Function_t functions[1024];
 int function_count = 0;
 
@@ -175,21 +177,46 @@ int main(int argc, char** argv)
     while (fgets(line, sizeof(line), infile)){
         line_number++;
         trim_line(line);
-        if (line[0] == '\n' || line[0] == '\r' || line[0] == '#') continue;
+        if (line[0] == '\n' || line[0] == '\0' || line[0] == '\r' || line[0] == '#') continue;
         char op[32] = {0};
         char arg1[32] = {0};
-        char arg2[32] = {0};
-        SymbolTable_t s_table = { .count = 0};
+        char arg2[128] = {0};
+        
+        char* line_ptr = line;
+        while (*line_ptr == ' ' || *line_ptr == '\t') line_ptr++;
+        int i = 0;
+        while (*line_ptr && *line_ptr != ' ' && *line_ptr != '\t' && i < 31){
+            op[i++] = *line_ptr++;
+        }
+        op[i] = '\0';
+        while (*line_ptr == ' ' || *line_ptr == '\t') line_ptr++;
 
-        int tokens = sscanf(line, "%31s %31s %31s", op, arg1, arg2);
-        if (tokens <= 0 || op[0] == '#') continue;
+        if (*line_ptr){
+            int i = 0;
+            while (*line_ptr && *line_ptr != ',' && *line_ptr != ' ' && *line_ptr != '\t' && i < 31){
+                arg1[i++] = *line_ptr++;
+            }
+            arg1[i] = '\0';
+            if (*line_ptr == ',') line_ptr++;
+            
+            // FIX: Skip whitespace before capturing arg2 so arg2[0] becomes '"' instead of ' '
+            while (*line_ptr == ' ' || *line_ptr == '\t') line_ptr++;
+
+            if (*line_ptr){
+                strncpy(arg2, line_ptr, sizeof(arg2) - 1);
+                arg2[sizeof(arg2) - 1] = '\0';
+                trim_line(arg2);
+            }
+        }
+
         if (is_label(op) == 0) continue;
 
         size_t len1 = strlen(arg1);
         if (len1 > 0 && arg1[len1 - 1] == ',') arg1[len1 - 1] = '\0';
         size_t len2 = strlen(arg2);
         if (len2 > 0 && arg2[len2 - 1] == ',') arg2[len2 - 1] = '\0';
-
+        
+        printf("DEBUG: op=[%s] arg1=[%s] arg2=[%s]\n", op, arg1, arg2);
         uint32_t compiled_instruction = 0;
         if (strcmp(op, "MOV") == 0 || strcmp(op, "mov") == 0){
             uint8_t dest = parse_operand(arg1, &s_table);
@@ -205,8 +232,8 @@ int main(int argc, char** argv)
         }
         else if (strcmp(op, "LET") == 0 || strcmp(op, "let") == 0){
             uint8_t dest = parse_operand(arg1, &s_table);
-            int src = parse_register(arg2);
-            if (arg2[0] == '"'){
+           
+            if (arg2[0] == '"'){ 
                 uint8_t imm_mode_dest = dest | SET_BIT7_TO_ONE;
                 char clean_str[128];
                 sscanf(arg2, "\"%[^\"]\"", clean_str); // Extracts text inside the quotes
@@ -216,6 +243,7 @@ int main(int argc, char** argv)
                 string_pool_offset += strlen(clean_str) + 1;
             }
             else{
+                int src = parse_register(arg2);
                 if (src != -1){
                     uint8_t reg_mode_dest = (dest & SET_BIT7_TO_ZERO);
                     compiled_instruction = OP_MOV | ((reg_mode_dest & 0xFF) << 8) | ((src & 0xFFFF) << 16);
@@ -335,6 +363,7 @@ int main(int argc, char** argv)
     fwrite(&count_64, sizeof(uint64_t), 1, outfile);
 
     uint32_t pool_size = string_pool_offset;
+    printf("DEBUG: Writing pool_size = %u\n", pool_size);
     fwrite(&pool_size, sizeof(uint32_t), 1, outfile);
     if (pool_size > 0) {
         fwrite(string_pool, 1, pool_size, outfile);
